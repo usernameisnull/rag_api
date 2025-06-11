@@ -27,6 +27,7 @@ class EmbeddingsProvider(Enum):
     OLLAMA = "ollama"
     BEDROCK = "bedrock"
     GOOGLE_VERTEXAI = "vertexai"
+    DashScope = "dashscope"
 
 
 def get_env_variable(
@@ -235,6 +236,12 @@ def init_embeddings(provider, model):
             model_id=model,
             region_name=AWS_DEFAULT_REGION,
         )
+    elif provider == EmbeddingsProvider.DashScope:
+        from langchain_community.embeddings import DashScopeEmbeddings
+        return DashScopeEmbeddings(
+            model=model,
+            dashscope_api_key=os.environ['RAG_DASHSCOPE_API_KEY']
+        )
     else:
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
@@ -268,6 +275,8 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
         "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
     )
     AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.DashScope:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-v4")
 else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
 
