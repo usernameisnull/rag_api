@@ -271,25 +271,31 @@ async def store_data_in_vector_db(
         for doc in documents
     ]
 
-    try:
-        if isinstance(vector_store, AsyncPgVector):
-            ids = await vector_store.aadd_documents(
-                docs, ids=[file_id] * len(documents)
+    # Split documents into batches of 10
+    batch_size = 10
+    all_ids = []
+    for i in range(0, len(docs), batch_size):
+        batch_docs = docs[i : i + batch_size]
+        batch_file_ids = [file_id] * len(batch_docs)
+        try:
+            if isinstance(vector_store, AsyncPgVector):
+                ids = await vector_store.aadd_documents(
+                    batch_docs, ids=batch_file_ids
+                )
+            else:
+                ids = vector_store.add_documents(batch_docs, ids=batch_file_ids)
+            all_ids.extend(ids)
+        except Exception as e:
+            logger.error(
+                "Failed to store data in vector DB for a batch | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
+                file_id,
+                user_id,
+                str(e),
+                traceback.format_exc(),
             )
-        else:
-            ids = vector_store.add_documents(docs, ids=[file_id] * len(documents))
+            return {"message": "An error occurred while adding documents.", "error": str(e)}
 
-        return {"message": "Documents added successfully", "ids": ids}
-
-    except Exception as e:
-        logger.error(
-            "Failed to store data in vector DB | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
-            file_id,
-            user_id,
-            str(e),
-            traceback.format_exc(),
-        )
-        return {"message": "An error occurred while adding documents.", "error": str(e)}
+    return {"message": "Documents added successfully", "ids": all_ids}
 
 
 @router.post("/local/embed")
