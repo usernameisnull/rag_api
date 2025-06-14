@@ -67,6 +67,11 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
+# 并发处理配置
+CONCURRENT_BATCH_SIZE = int(get_env_variable("CONCURRENT_BATCH_SIZE", "5"))
+SUCCESS_RATE_THRESHOLD = int(get_env_variable("SUCCESS_RATE_THRESHOLD", "90"))
+REQUEST_TIMEOUT = int(get_env_variable("REQUEST_TIMEOUT", "10"))  # 请求超时时间，默认10秒
+
 env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
 PDF_EXTRACT_IMAGES = True if env_value == "true" else False
 

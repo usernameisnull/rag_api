@@ -5,7 +5,7 @@ import traceback
 import aiofiles
 import aiofiles.os
 from shutil import copyfileobj
-from typing import List, Iterable
+from typing import List, Iterable, Dict, Any
 from fastapi import (
     APIRouter,
     Request,
@@ -21,8 +21,19 @@ from langchain_core.documents import Document
 from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
+import asyncio
 
-from app.config import logger, vector_store, RAG_UPLOAD_DIR, CHUNK_SIZE, CHUNK_OVERLAP
+from app.config import (
+    logger,
+    vector_store,
+    RAG_UPLOAD_DIR,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    PDF_EXTRACT_IMAGES,
+    CONCURRENT_BATCH_SIZE,
+    SUCCESS_RATE_THRESHOLD,
+    REQUEST_TIMEOUT,
+)
 from app.constants import ERROR_MESSAGES
 from app.models import (
     StoreDocument,
@@ -241,24 +252,59 @@ def generate_digest(page_content: str):
     return hash_obj.hexdigest()
 
 
-async def store_data_in_vector_db(
-    data: Iterable[Document],
+async def process_batch(
+    vector_store: Any,
+    batch_docs: List[Document],
+    batch_file_ids: List[str],
     file_id: str,
-    user_id: str = "",
-    clean_content: bool = False,
-) -> bool:
+    user_id: str,
+) -> Dict[str, Any]:
+    """处理单个批次的文档"""
+    try:
+        if isinstance(vector_store, AsyncPgVector):
+            # 使用配置的超时时间
+            try:
+                ids = await asyncio.wait_for(
+                    vector_store.aadd_documents(batch_docs, ids=batch_file_ids),
+                    timeout=REQUEST_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Request timeout while storing data in vector DB | File ID: %s | User ID: %s | Timeout: %d seconds",
+                    file_id,
+                    user_id,
+                    REQUEST_TIMEOUT
+                )
+                return {"success": False, "error": f"Request timeout after {REQUEST_TIMEOUT} seconds"}
+        else:
+            ids = vector_store.add_documents(batch_docs, ids=batch_file_ids)
+        return {"success": True, "ids": ids}
+    except Exception as e:
+        logger.error(
+            "Failed to store data in vector DB for a batch | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
+            file_id,
+            user_id,
+            str(e),
+            traceback.format_exc(),
+        )
+        return {"success": False, "error": str(e)}
+
+
+async def add_documents_to_vector_store(
+    docs: List[Document],
+    file_id: str,
+    user_id: str,
+    vector_store: Any,
+) -> Dict[str, Any]:
+    """将文档添加到向量存储中，支持并发处理和成功率检查"""
+    # 首先对文档进行分块处理
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
     )
-    documents = text_splitter.split_documents(data)
+    documents = text_splitter.split_documents(docs)
 
-    # If `clean_content` is True, clean the page_content of each document (remove null bytes)
-    if clean_content:
-        for doc in documents:
-            doc.page_content = clean_text(doc.page_content)
-
-    # Preparing documents with page content and metadata for insertion.
-    docs = [
+    # 准备文档元数据
+    processed_docs = [
         Document(
             page_content=doc.page_content,
             metadata={
@@ -271,31 +317,65 @@ async def store_data_in_vector_db(
         for doc in documents
     ]
 
-    # Split documents into batches of 10
+    # 将文档分成批次
     batch_size = 10
+    all_results = []
     all_ids = []
-    for i in range(0, len(docs), batch_size):
-        batch_docs = docs[i : i + batch_size]
+    
+    # 创建所有批次的任务
+    tasks = []
+    for i in range(0, len(processed_docs), batch_size):
+        batch_docs = processed_docs[i : i + batch_size]
         batch_file_ids = [file_id] * len(batch_docs)
-        try:
-            if isinstance(vector_store, AsyncPgVector):
-                ids = await vector_store.aadd_documents(
-                    batch_docs, ids=batch_file_ids
-                )
-            else:
-                ids = vector_store.add_documents(batch_docs, ids=batch_file_ids)
-            all_ids.extend(ids)
-        except Exception as e:
-            logger.error(
-                "Failed to store data in vector DB for a batch | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
-                file_id,
-                user_id,
-                str(e),
-                traceback.format_exc(),
-            )
-            return {"message": "An error occurred while adding documents.", "error": str(e)}
-
-    return {"message": "Documents added successfully", "ids": all_ids}
+        tasks.append(process_batch(vector_store, batch_docs, batch_file_ids, file_id, user_id))
+    
+    total_tasks = len(tasks)
+    completed_tasks = 0
+    logger.info(f"开始处理文档 | 文件ID: {file_id} | 总批次数: {total_tasks}")
+    
+    # 并发执行任务，控制并发数
+    for i in range(0, len(tasks), CONCURRENT_BATCH_SIZE):
+        batch_tasks = tasks[i : i + CONCURRENT_BATCH_SIZE]
+        batch_results = await asyncio.gather(*batch_tasks)
+        all_results.extend(batch_results)
+        
+        # 更新进度
+        completed_tasks += len(batch_tasks)
+        logger.info(f"文档处理进度 | 文件ID: {file_id} | 已完成: {completed_tasks}/{total_tasks} | 成功率: {(len([r for r in all_results if r['success']]) / completed_tasks * 100):.2f}%")
+    
+    # 统计成功和失败的数量
+    successful_results = [r for r in all_results if r["success"]]
+    failed_results = [r for r in all_results if not r["success"]]
+    
+    # 计算成功率
+    total_batches = len(all_results)
+    success_rate = (len(successful_results) / total_batches) * 100 if total_batches > 0 else 0
+    
+    # 收集所有成功的ID
+    for result in successful_results:
+        all_ids.extend(result["ids"])
+    
+    # 最终处理结果日志
+    logger.info(f"文档处理完成 | 文件ID: {file_id} | 总批次数: {total_batches} | 成功: {len(successful_results)} | 失败: {len(failed_results)} | 成功率: {success_rate:.2f}%")
+    
+    # 检查是否达到成功率阈值
+    if success_rate >= SUCCESS_RATE_THRESHOLD:
+        return {
+            "message": "Documents added successfully",
+            "ids": all_ids,
+            "success_rate": success_rate,
+            "failed_batches": len(failed_results),
+            "total_batches": total_batches
+        }
+    else:
+        error_messages = [r["error"] for r in failed_results]
+        return {
+            "message": "Failed to add documents due to low success rate",
+            "error": f"Success rate {success_rate}% is below threshold {SUCCESS_RATE_THRESHOLD}%",
+            "failed_batches": len(failed_results),
+            "total_batches": total_batches,
+            "error_details": error_messages
+        }
 
 
 @router.post("/local/embed")
@@ -319,7 +399,7 @@ async def embed_local_file(
             document.filename, document.file_content_type, document.filepath
         )
         data = loader.load()
-        result = await store_data_in_vector_db(data, document.file_id, user_id)
+        result = await add_documents_to_vector_store(data, document.file_id, user_id, vector_store)
 
         if result:
             return {
@@ -395,9 +475,7 @@ async def embed_file(
             file.filename, file.content_type, temp_file_path
         )
         data = loader.load()
-        result = await store_data_in_vector_db(
-            data=data, file_id=file_id, user_id=user_id, clean_content=file_ext == "pdf"
-        )
+        result = await add_documents_to_vector_store(data, file_id, user_id, vector_store)
 
         if not result:
             response_status = False
@@ -530,7 +608,7 @@ async def embed_file_upload(
         )
 
         data = loader.load()
-        result = await store_data_in_vector_db(data, file_id, user_id)
+        result = await add_documents_to_vector_store(data, file_id, user_id, vector_store)
 
         if not result:
             raise HTTPException(
