@@ -22,6 +22,7 @@ from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
+import time
 
 from app.config import (
     logger,
@@ -297,6 +298,7 @@ async def add_documents_to_vector_store(
     vector_store: Any,
 ) -> Dict[str, Any]:
     """将文档添加到向量存储中，支持并发处理和成功率检查"""
+    start_time = time.time()
     # 首先对文档进行分块处理
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
@@ -322,41 +324,65 @@ async def add_documents_to_vector_store(
     all_results = []
     all_ids = []
     
-    # 创建所有批次的任务
-    tasks = []
+    # 创建任务队列
+    task_queue = asyncio.Queue()
     for i in range(0, len(processed_docs), batch_size):
         batch_docs = processed_docs[i : i + batch_size]
         batch_file_ids = [file_id] * len(batch_docs)
-        tasks.append(process_batch(vector_store, batch_docs, batch_file_ids, file_id, user_id))
+        await task_queue.put((batch_docs, batch_file_ids))
     
-    total_tasks = len(tasks)
+    total_tasks = task_queue.qsize()
     completed_tasks = 0
-    logger.info(f"开始处理文档 | 文件ID: {file_id} | 总批次数: {total_tasks}")
     
-    # 并发执行任务，控制并发数
-    for i in range(0, len(tasks), CONCURRENT_BATCH_SIZE):
-        batch_tasks = tasks[i : i + CONCURRENT_BATCH_SIZE]
-        batch_results = await asyncio.gather(*batch_tasks)
-        all_results.extend(batch_results)
-        
-        # 更新进度
-        completed_tasks += len(batch_tasks)
-        logger.info(f"文档处理进度 | 文件ID: {file_id} | 已完成: {completed_tasks}/{total_tasks} | 成功率: {(len([r for r in all_results if r['success']]) / completed_tasks * 100):.2f}%")
+    # 创建信号量来控制并发
+    semaphore = asyncio.Semaphore(CONCURRENT_BATCH_SIZE)
+    
+    async def worker():
+        nonlocal completed_tasks
+        while True:
+            try:
+                batch_docs, batch_file_ids = await task_queue.get()
+                async with semaphore:
+                    result = await process_batch(vector_store, batch_docs, batch_file_ids, file_id, user_id)
+                    all_results.append(result)
+                    if result["success"]:
+                        all_ids.extend(result["ids"])
+                    
+                    completed_tasks += 1
+                    logger.info(
+                        f"文档处理进度 | 文件ID: {file_id} | 已完成: {completed_tasks}/{total_tasks} | "
+                        f"成功率: {(len([r for r in all_results if r['success']]) / completed_tasks * 100):.2f}%"
+                    )
+            except asyncio.CancelledError:
+                break
+            finally:
+                task_queue.task_done()
+    
+    # 创建并启动工作协程
+    workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_BATCH_SIZE)]
+    
+    # 等待所有任务完成
+    await task_queue.join()
+    
+    # 取消所有工作协程
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
     
     # 统计成功和失败的数量
     successful_results = [r for r in all_results if r["success"]]
     failed_results = [r for r in all_results if not r["success"]]
     
     # 计算成功率
-    total_batches = len(all_results)
-    success_rate = (len(successful_results) / total_batches) * 100 if total_batches > 0 else 0
-    
-    # 收集所有成功的ID
-    for result in successful_results:
-        all_ids.extend(result["ids"])
+    success_rate = (len(successful_results) / total_tasks) * 100 if total_tasks > 0 else 0
     
     # 最终处理结果日志
-    logger.info(f"文档处理完成 | 文件ID: {file_id} | 总批次数: {total_batches} | 成功: {len(successful_results)} | 失败: {len(failed_results)} | 成功率: {success_rate:.2f}%")
+    total_time = time.time() - start_time
+    logger.info(
+        f"文档处理完成 | 文件ID: {file_id} | 总批次数: {total_tasks} | "
+        f"成功: {len(successful_results)} | 失败: {len(failed_results)} | 成功率: {success_rate:.2f}% | "
+        f"总耗时: {total_time:.2f}秒"
+    )
     
     # 检查是否达到成功率阈值
     if success_rate >= SUCCESS_RATE_THRESHOLD:
@@ -365,7 +391,7 @@ async def add_documents_to_vector_store(
             "ids": all_ids,
             "success_rate": success_rate,
             "failed_batches": len(failed_results),
-            "total_batches": total_batches
+            "total_batches": total_tasks
         }
     else:
         error_messages = [r["error"] for r in failed_results]
@@ -373,7 +399,7 @@ async def add_documents_to_vector_store(
             "message": "Failed to add documents due to low success rate",
             "error": f"Success rate {success_rate}% is below threshold {SUCCESS_RATE_THRESHOLD}%",
             "failed_batches": len(failed_results),
-            "total_batches": total_batches,
+            "total_batches": total_tasks,
             "error_details": error_messages
         }
 
